@@ -9,7 +9,10 @@
 
   var CHUNK = 16 * 1024 * 1024; // 每次请求传 16 MB；断线只用重传这一块
   var PARALLEL = 3; // 同时传几个文件
-  var STALL_MS = 15000; // 这么久没有一点进度，就当连接卡死了：问清楚进度后接着传
+  // 上传进度停了这么久、电脑那边也确认这段时间一个字节都没收到，就当连接卡死了，
+  // 马上换一个新连接接着传。Wi-Fi 抖一下之后，旧的 TCP 连接重传间隔会越拉越长
+  // （1、2、4、8 秒……），等它自己恢复往往要十几秒，换新连接快得多。
+  var STALL_MS = 6000;
   var MAX_TRIES = 60; // 连续失败这么多次（约 5 分钟）才放弃；每成功一块就重新计数
 
   var UA = navigator.userAgent || '';
@@ -118,9 +121,11 @@
 
   // ---------------------------------------------------------------- 网络请求
 
-  function api(method, url, body, cb) {
+  // timeout（毫秒，可不填）：到时间没回应就当失败（status 0），免得在网络断着时一直挂着
+  function api(method, url, body, cb, timeout) {
     var x = new XMLHttpRequest();
     x.open(method, url, true);
+    if (timeout) { try { x.timeout = timeout; } catch (e) {} }
     x.setRequestHeader('X-LT', '1');
     x.setRequestHeader('X-Device-Id', me.id);
     x.setRequestHeader('X-Device-Name', encodeURIComponent(me.name));
@@ -708,12 +713,12 @@
     u.sent = u.cur = n;
   }
 
-  // 连接断了：等一会儿（越试等得越久，最多 5 秒），然后先问进度再接着发
+  // 连接断了：第一次马上换新连接，再失败就等一会儿（越试等得越久，最多 5 秒），先问进度再接着发
   function retry(u) {
     if (u.state !== 'sending' && u.state !== 'retry') return;
     u.tries++;
     if (u.tries > MAX_TRIES) { failUpload(u, '连不上电脑了：手机还连着同一个 Wi-Fi 吗？电脑上的程序还开着吗？'); return; }
-    restart(u, Math.min(600 * u.tries, 5000));
+    restart(u, Math.min(500 * (u.tries - 1), 5000));
   }
 
   // 作废正在进行的请求，delay 毫秒后问进度、接着传
@@ -722,6 +727,8 @@
     if (u.xhr) { var x = u.xhr; u.xhr = null; try { x.abort(); } catch (e) {} }
     clearTimeout(u.retryTimer);
     u.state = 'retry';
+    u.peekSig = '';
+    u.lastAlive = 0;
     rerender(u.id);
     u.retryTimer = setTimeout(function () { probe(u); }, delay);
   }
@@ -739,7 +746,22 @@
       }
       if (st === 401) { failUpload(u, '需要重新输入访问码'); return; }
       retry(u);
-    });
+    }, 5000);
+  }
+
+  // 上传进度好几秒没动时，问一下电脑：这个上传的数据还在往它那儿走吗？
+  // 浏览器把一块数据全塞进发送缓冲区以后就不再报进度了，光看进度会误判成卡死。
+  function peek(u) {
+    var my = u.attempt;
+    u.peeking = true;
+    u.lastPeek = Date.now();
+    api('GET', '/api/upload?id=' + u.id + '&peek=1', null, function (st, d) {
+      u.peeking = false;
+      if (my !== u.attempt || u.state !== 'sending' || st !== 200 || !d.active) return;
+      var sig = d.gen + ':' + d.rx;
+      if (u.peekSig && u.peekSig !== sig) u.lastAlive = Date.now(); // 比上次多收到了：连接还活着
+      u.peekSig = sig;
+    }, 3000);
   }
 
   function failUpload(u, msg) {
@@ -806,7 +828,7 @@
     var small = !!el.querySelector('.ov'), s = '';
     if (u.state === 'queued') s = '等待发送 · ' + fmtSize(u.size);
     else if (u.state === 'sending') {
-      var stuck = Date.now() - u.lastTick > 3000, fast = !stuck && u.speed >= 1024;
+      var stuck = Date.now() - Math.max(u.lastTick, u.lastAlive || 0) > 3000, fast = !stuck && u.speed >= 1024;
       s = Math.floor(pct) + '%';
       if (stuck) s += ' · 等待网络…';
       else if (fast) s += ' · ' + fmtSize(u.speed) + '/s';
@@ -861,8 +883,11 @@
       if (u.state === 'sending') {
         busy = true;
         u.speed = rate(u.samples, now, u.cur);
-        // 这么久一点进展都没有：当这个连接死了，问清楚进度重来
-        if (now - u.lastTick > STALL_MS) retry(u);
+        // 进度停了 2.5 秒就开始问电脑还有没有在收；停够 STALL_MS 且电脑也没收到新数据，
+        // 就当这个连接死了，换新连接从电脑说的位置接着传
+        var quiet = now - Math.max(u.lastTick, u.lastAlive || 0);
+        if (quiet > STALL_MS) retry(u);
+        else if (quiet > 2500 && !u.peeking && now - (u.lastPeek || 0) >= 1000) peek(u);
       } else {
         u.samples = [];
         u.speed = 0;

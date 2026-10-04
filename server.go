@@ -46,6 +46,8 @@ type Server struct {
 	finalMu sync.Mutex
 	claimMu sync.Mutex
 	claims  map[string]*uploadClaim // 每个上传当前由哪个请求在处理
+	statMu  sync.Mutex
+	stats   map[string]*upStat
 	local   localIPs
 
 	// noHostTrust 让本机也当成普通设备，只在测试里用
@@ -70,6 +72,7 @@ func newServer(cfg *Config, dataDir string, port int) (*Server, error) {
 		limiter: newLimiter(),
 		uploads: keyedMutex{m: map[string]*kmEntry{}},
 		claims:  map[string]*uploadClaim{},
+		stats:   map[string]*upStat{},
 	}
 	s.noHostTrust = os.Getenv("LT_DEV_GUEST") == "1"
 	go cleanIncoming(cfg.Dir)

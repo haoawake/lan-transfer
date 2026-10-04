@@ -47,10 +47,14 @@ var errSuperseded = errors.New("被同一个上传的新请求顶替了")
 
 var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
 
+var claimGen atomic.Uint64
+
 // uploadClaim 记着某个上传当前是哪个请求在处理
 type uploadClaim struct {
 	stopped atomic.Bool
 	rc      *http.ResponseController
+	gen     uint64       // 每个请求一个编号
+	rx      atomic.Int64 // 这个请求已经从网络上读到多少字节；网页靠它判断连接是不是还活着
 }
 
 func (c *uploadClaim) stop() {
@@ -62,7 +66,7 @@ func (c *uploadClaim) stop() {
 
 // claim 宣布由这个请求处理上传 id：还挂着的旧请求立刻被掐掉
 func (s *Server) claim(id string, rc *http.ResponseController) (*uploadClaim, func()) {
-	c := &uploadClaim{rc: rc}
+	c := &uploadClaim{rc: rc, gen: claimGen.Add(1)}
 	s.claimMu.Lock()
 	if old := s.claims[id]; old != nil {
 		old.stop()
@@ -95,10 +99,47 @@ func (ir idleReader) Read(p []byte) (int, error) {
 		return 0, errSuperseded
 	}
 	n, err := ir.r.Read(p)
+	if n > 0 {
+		ir.c.rx.Add(int64(n))
+	}
 	if err != nil && ir.c.stopped.Load() {
 		err = errSuperseded
 	}
 	return n, err
+}
+
+// upStat 记着一个上传从开始到传完的情况，传完时打印在控制台里，方便看传输顺不顺
+type upStat struct {
+	start   time.Time
+	name    string
+	resumes int // 中途卡住、换新连接接着传的次数
+}
+
+func (s *Server) upStat(id, name string) *upStat {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	st := s.stats[id]
+	if st == nil {
+		for k, v := range s.stats { // 顺手清掉一天前没传完的
+			if time.Since(v.start) > 24*time.Hour {
+				delete(s.stats, k)
+			}
+		}
+		st = &upStat{start: time.Now()}
+		s.stats[id] = st
+	}
+	if name != "" {
+		st.name = name
+	}
+	return st
+}
+
+func (s *Server) dropStat(id string) *upStat {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	st := s.stats[id]
+	delete(s.stats, id)
+	return st
 }
 
 // drain 读掉请求体里剩下的部分。提前回应前必须这样做，浏览器才收得到回应
@@ -117,6 +158,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	name := sanitizeName(q.Get("name"))
 	dev := deviceOf(r)
+	s.upStat(id, name)
 
 	c, release := s.claim(id, http.NewResponseController(w))
 	defer release()
@@ -127,6 +169,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 已经传完了（比如上一块的响应在路上丢了，网页又重发）：直接告诉它完成了
 	if it, ok := s.store.Get(id); ok {
 		drain(body)
+		s.dropStat(id)
 		writeJSON(w, http.StatusOK, map[string]any{"done": true, "item": s.pub(it)})
 		return
 	}
@@ -235,8 +278,28 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	s.store.Add(it)
 	pub := s.pub(*it)
 	s.hub.Broadcast("item", pub)
-	logf("文件 · %s：%s（%s）", dev.Name, name, humanSize(size))
+	logf("文件 · %s：%s（%s%s）", dev.Name, name, humanSize(size), statSummary(s.dropStat(id), size))
 	writeJSON(w, http.StatusOK, map[string]any{"done": true, "item": pub})
+}
+
+// statSummary：大文件传完时附上用时、平均速度和中途卡住的次数
+func statSummary(st *upStat, size int64) string {
+	if st == nil || size < 16<<20 {
+		return ""
+	}
+	d := time.Since(st.start)
+	out := fmt.Sprintf("，用时 %s，平均 %s/s", humanDuration(d), humanSize(int64(float64(size)/d.Seconds())))
+	if st.resumes > 0 {
+		out += fmt.Sprintf("，中途卡住 %d 次", st.resumes)
+	}
+	return out
+}
+
+func humanDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.1f 秒", d.Seconds())
+	}
+	return fmt.Sprintf("%d 分 %d 秒", int(d.Minutes()), int(d.Seconds())%60)
 }
 
 func fullMsg(free uint64, size int64) string {
@@ -246,12 +309,28 @@ func fullMsg(free uint64, size int64) string {
 
 // handleUploadStatus 告诉网页电脑上已经收到了多少。网页断线后先问这个，再从这里接着发，
 // 不用把已经传过的部分再发一遍。顺带把还挂着的旧请求掐掉。
+//
+// 带 peek=1 时只是看一眼：不掐旧请求，返回正在处理这个上传的请求编号和它已经读到的字节数。
+// 网页好几秒没看到上传进度时用它判断——数据还在往电脑上走（只是浏览器没报进度），
+// 还是连接真的卡死了、该换个新连接。
 func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if !validID(id) {
 		writeErr(w, http.StatusBadRequest, "参数不对")
 		return
 	}
+	if r.URL.Query().Get("peek") == "1" {
+		s.claimMu.Lock()
+		c := s.claims[id]
+		s.claimMu.Unlock()
+		if c == nil || c.rc == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"active": false})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"active": true, "gen": c.gen, "rx": c.rx.Load()})
+		return
+	}
+
 	_, release := s.claim(id, nil)
 	defer release()
 	unlock := s.uploads.lock(id)
@@ -263,6 +342,11 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 	var have int64
 	if st, err := os.Stat(s.partPath(s.config().Dir, id)); err == nil {
 		have = st.Size()
+	}
+	// 网页只在断线、卡住之后才来问进度，所以每问一次就是卡了一次
+	if st := s.upStat(id, ""); st != nil {
+		st.resumes++
+		logf("卡住了一下 · %s：%s 从 %s 处接着传（第 %d 次）", deviceOf(r).Name, st.name, humanSize(have), st.resumes)
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"received": have})
 }
@@ -298,6 +382,7 @@ func (s *Server) handleUploadCancel(w http.ResponseWriter, r *http.Request) {
 	_, release := s.claim(id, nil)
 	unlock := s.uploads.lock(id)
 	_ = os.Remove(s.partPath(s.config().Dir, id))
+	s.dropStat(id)
 	unlock()
 	release()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

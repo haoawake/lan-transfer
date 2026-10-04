@@ -162,3 +162,29 @@ func readResponse(t *testing.T, conn net.Conn, timeout time.Duration) (int, stri
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(b)
 }
+
+// peek 只看不动：报告正在传的请求读到了多少，不会把它掐掉；正式问进度才会顶替它
+func TestPeekReportsLivenessWithoutPreempting(t *testing.T) {
+	_, ts := newTestServer(t)
+	c := client(t)
+	login(t, c, ts.URL)
+	id := "peek000000000001"
+	conn := rawUpload(t, ts, id, 64<<20, 0, 16<<20, false) // 发了 1 MB 就不动了
+	defer conn.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	_, m := do(t, c, "GET", ts.URL+"/api/upload?id="+id+"&peek=1", nil)
+	if m["active"] != true || m["rx"].(float64) != 1<<20 {
+		t.Fatalf("peek 应该看到正在传、已读 1 MB：%v", m)
+	}
+	gen := m["gen"]
+	_, m = do(t, c, "GET", ts.URL+"/api/upload?id="+id+"&peek=1", nil)
+	if m["active"] != true || m["gen"] != gen {
+		t.Fatalf("peek 不该顶替正在传的请求：%v", m)
+	}
+	do(t, c, "GET", ts.URL+"/api/upload?id="+id, nil) // 正式问进度：顶替掉卡住的旧请求
+	_, m = do(t, c, "GET", ts.URL+"/api/upload?id="+id+"&peek=1", nil)
+	if m["active"] != false {
+		t.Fatalf("旧请求被顶替后应该没有正在传的请求了：%v", m)
+	}
+}
