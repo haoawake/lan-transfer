@@ -1,0 +1,6 @@
+dist/
+build/
+*.exe
+# go-winres 生成的 Windows 资源，构建脚本每次重新生成
+rsrc_windows_*.syso
+.DS_Store

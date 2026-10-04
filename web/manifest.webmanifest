@@ -1,0 +1,14 @@
+{
+  "name": "文件传输助手",
+  "short_name": "传输助手",
+  "description": "局域网里的手机、平板、电脑互传文件、图片、视频和文字",
+  "start_url": "/",
+  "display": "browser",
+  "background_color": "#f5f6f8",
+  "theme_color": "#f5f6f8",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
