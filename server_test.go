@@ -156,10 +156,10 @@ func TestChunkedUploadResumeAndDownload(t *testing.T) {
 	if resp.StatusCode != 200 || m["received"].(float64) != 100 {
 		t.Fatalf("第一块：%d %v", resp.StatusCode, m)
 	}
-	// 网页以为没发成功，从 0 重发：应该告诉它电脑上已经有 100 字节了
+	// 网页以为没发成功，从 0 重发：重复的部分直接跳过，告诉它电脑上已经有 100 字节了
 	resp, m = upload(t, c, ts.URL, id, "%E7%85%A7%E7%89%87.jpg", 250, 0, data[:100])
-	if resp.StatusCode != 409 || m["received"].(float64) != 100 {
-		t.Fatalf("重复的块应该 409：%d %v", resp.StatusCode, m)
+	if resp.StatusCode != 200 || m["received"].(float64) != 100 {
+		t.Fatalf("重复的块应该被接受且不重复写入：%d %v", resp.StatusCode, m)
 	}
 	upload(t, c, ts.URL, id, "%E7%85%A7%E7%89%87.jpg", 250, 100, data[100:200])
 	resp, m = upload(t, c, ts.URL, id, "%E7%85%A7%E7%89%87.jpg", 250, 200, data[200:])

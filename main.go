@@ -168,6 +168,9 @@ func printBanner(s *Server, port, wanted int, opened bool) {
 		fmt.Printf("  注意：端口 %d 被别的程序占用了，这次用的是 %d。\n", wanted, port)
 	}
 	fmt.Printf("\n  收到的文件保存在：%s\n", cfg.Dir)
+	if free, err := diskFree(cfg.Dir); err == nil && free < 2<<30 {
+		fmt.Printf("  注意：这个盘只剩 %s 了，大文件会传不进来。可以在网页右上角「···」里换到别的盘。\n", humanSize(int64(free)))
+	}
 	if runtime.GOOS == "windows" {
 		fmt.Println("  第一次运行如果弹出 Windows 防火墙提示，请点「允许访问」，手机才能连上。")
 	}

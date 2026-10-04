@@ -20,6 +20,7 @@ var (
 	procGetConsoleMode       = kernel32.NewProc("GetConsoleMode")
 	procSetConsoleMode       = kernel32.NewProc("SetConsoleMode")
 	procSetFileAttributesW   = kernel32.NewProc("SetFileAttributesW")
+	procGetDiskFreeSpaceExW  = kernel32.NewProc("GetDiskFreeSpaceExW")
 	procShellExecuteW        = shell32.NewProc("ShellExecuteW")
 	procSHGetKnownFolderPath = shell32.NewProc("SHGetKnownFolderPath")
 	procCoTaskMemFree        = ole32.NewProc("CoTaskMemFree")
@@ -103,6 +104,21 @@ func hideFile(path string) {
 		const fileAttributeHidden = 0x2
 		procSetFileAttributesW.Call(uintptr(unsafe.Pointer(p)), fileAttributeHidden)
 	}
+}
+
+// diskFree 返回 path 所在磁盘上当前用户还能用的空间
+func diskFree(path string) (uint64, error) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	var avail, total, free uint64
+	r, _, e := procGetDiskFreeSpaceExW.Call(uintptr(unsafe.Pointer(p)),
+		uintptr(unsafe.Pointer(&avail)), uintptr(unsafe.Pointer(&total)), uintptr(unsafe.Pointer(&free)))
+	if r == 0 {
+		return 0, e
+	}
+	return avail, nil
 }
 
 func isDiskFull(err error) bool {

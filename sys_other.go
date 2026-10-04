@@ -65,6 +65,15 @@ func revealFile(path string) error {
 
 func hideFile(string) {} // 以点开头的文件夹本来就是隐藏的
 
+// diskFree 返回 path 所在磁盘上当前用户还能用的空间
+func diskFree(path string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
+}
+
 func isDiskFull(err error) bool {
 	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
 }

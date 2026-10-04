@@ -9,8 +9,8 @@
 
   var CHUNK = 16 * 1024 * 1024; // 每次请求传 16 MB；断线只用重传这一块
   var PARALLEL = 3; // 同时传几个文件
-  var STALL_MS = 30000; // 这么久没有一点进度，就当连接卡死了，重传这一块
-  var MAX_TRIES = 12;
+  var STALL_MS = 15000; // 这么久没有一点进度，就当连接卡死了：问清楚进度后接着传
+  var MAX_TRIES = 60; // 连续失败这么多次（约 5 分钟）才放弃；每成功一块就重新计数
 
   var UA = navigator.userAgent || '';
   var isIOS = /iPad|iPhone|iPod/.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
@@ -47,7 +47,7 @@
 
   function fmtSize(n) {
     if (!(n > 0)) return '0 B';
-    if (n < 1024) return n + ' B';
+    if (n < 1024) return Math.round(n) + ' B';
     var u = ['KB', 'MB', 'GB', 'TB'], i = -1;
     do { n /= 1024; i++; } while (n >= 1024 && i < 3);
     return (n >= 100 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2)) + ' ' + u[i];
@@ -469,6 +469,7 @@
     updateEmpty();
     if (sheetKind === 'qr') showQR();
     else if (sheetKind === 'settings') showSettings();
+    updateBanner();
   }
 
   function setHost(flag, info) {
@@ -477,6 +478,7 @@
     if (info) host = info;
     $('btn-qr').hidden = !isHost;
     if (changed) rerenderAll();
+    updateBanner();
   }
 
   // ---------------------------------------------------------------- 在线设备、连接状态
@@ -513,6 +515,11 @@
         '：可以发文件，但下载很可能被拦截。点右上角「···」→「在浏览器打开」就都能用了。<button type="button" class="x" id="banner-x">×</button>';
       b.hidden = false;
       $('banner-x').onclick = function () { bannerDismissed = true; updateBanner(); };
+    } else if (isHost && host && host.free > 0 && host.free < 1073741824) {
+      // 只在电脑上提示：接收文件夹所在的盘快满了
+      b.className = 'banner';
+      b.innerHTML = '接收文件夹所在的硬盘只剩 ' + fmtSize(host.free) + ' 了，大文件会传不进来。<button type="button" class="linkish" data-sa="settings">换个文件夹</button>';
+      b.hidden = false;
     } else b.hidden = true;
   }
 
@@ -581,12 +588,21 @@
     if (document.hidden) return;
     if (unread) { unread = 0; document.title = '文件传输助手'; }
     if (es && Date.now() - lastEvent > 25000) connect();
-    for (var id in uploads) if (uploads[id].state === 'retry') kick(uploads[id]);
+    // 手机锁屏、切后台回来：卡住的上传不等定时器，马上问清楚电脑收到多少，接着传
+    for (var id in uploads) {
+      var u = uploads[id];
+      if (u.state === 'retry' || (u.state === 'sending' && Date.now() - u.lastTick > 3000)) restart(u, 0);
+    }
   });
 
   // ---------------------------------------------------------------- 上传
+  //
+  // 每个文件按 16 MB 一块顺序发。断线以后不能直接从这块开头重发：电脑上可能已经有这块的
+  // 前半截。所以先 GET /api/upload?id= 问清楚收到了多少，再从那里接着发。
+  // u.attempt 是这个文件当前这次请求的编号，旧请求的回调对不上编号就什么都不做，
+  // 保证同一个文件任何时候只有一条请求链。
 
-  var queue = [], active = 0, sentTotal = 0, speed = 0, lastBytes = 0, lastT = 0, ticker = null;
+  var queue = [], active = 0, sentTotal = 0, speed = 0, speedSamples = [], ticker = null;
 
   function slice(f, a, b) {
     var fn = f.slice || f.webkitSlice || f.mozSlice;
@@ -609,7 +625,7 @@
       var f = arr[i];
       var u = {
         id: rid(), file: f, name: pastedName(f), size: f.size || 0, type: f.type || '',
-        sent: 0, cur: 0, tries: 0, c409: 0, state: 'queued', seq: seq++, speed: 0, lastCur: 0, lastTick: 0
+        sent: 0, cur: 0, tries: 0, c409: 0, state: 'queued', seq: seq++, speed: 0, samples: [], lastTick: 0, attempt: 0
       };
       uploads[u.id] = u;
       upsert({ id: u.id, pending: true, type: 'file', name: u.name, size: u.size, mime: u.type, fromId: me.id, from: me.name, time: Date.now(), seq: u.seq }, true);
@@ -628,7 +644,11 @@
       if (u.state !== 'queued') continue;
       u.slot = true;
       active++;
-      sendChunk(u);
+      if (u.needProbe) { // 手动重试的：先问清楚电脑上有多少
+        u.needProbe = false;
+        u.state = 'retry';
+        probe(u);
+      } else sendChunk(u);
     }
     paintTotals();
   }
@@ -640,7 +660,7 @@
   function sendChunk(u) {
     if (u.state === 'canceled' || u.state === 'done') return;
     u.state = 'sending';
-    var start = u.sent, end = Math.min(u.size, start + CHUNK);
+    var my = ++u.attempt, start = u.sent, end = Math.min(u.size, start + CHUNK);
     var x = new XMLHttpRequest();
     u.xhr = x;
     x.open('POST', '/api/upload?id=' + u.id + '&size=' + u.size + '&offset=' + start + '&name=' + encodeURIComponent(u.name), true);
@@ -651,34 +671,35 @@
     u.lastTick = Date.now();
     if (x.upload) {
       x.upload.onprogress = function (e) {
+        if (my !== u.attempt) return;
         var c = start + e.loaded;
         if (c > u.cur) { sentTotal += c - u.cur; u.cur = c; }
         u.lastTick = Date.now();
       };
     }
     x.onload = function () {
-      if (u.xhr !== x) return;
+      if (my !== u.attempt) return;
       u.xhr = null;
       var d = parseJSON(x.responseText) || {};
       if (x.status === 200 && d.done && d.item) { finishUpload(u, d.item); return; }
-      if (x.status === 200 && typeof d.received === 'number') {
-        u.tries = 0; u.c409 = 0;
-        setSent(u, d.received);
-        sendChunk(u);
-        return;
-      }
-      if (x.status === 409 && typeof d.received === 'number' && u.c409++ < 5) {
-        setSent(u, d.received); // 电脑上已经有这么多了，从这里接着传
+      if ((x.status === 200 || x.status === 409) && typeof d.received === 'number') {
+        // 200：这块收好了；409：电脑上的进度和网页以为的不一样。都从电脑说的位置接着发
+        if (x.status === 200) { u.tries = 0; u.c409 = 0; }
+        else if (++u.c409 > 5) { failUpload(u, '电脑上的进度一直对不上，请点「重试」'); return; }
+        setSent(u, Math.min(d.received, u.size));
         sendChunk(u);
         return;
       }
       if (x.status === 401) { failUpload(u, '需要重新输入访问码'); needLogin(); return; }
-      if (x.status === 507) { failUpload(u, '电脑硬盘空间不够了'); return; }
-      if (x.status >= 400 && x.status < 500 && x.status !== 408 && x.status !== 409) { failUpload(u, d.error || '电脑拒绝了（' + x.status + '）'); return; }
+      if (x.status === 507) { failUpload(u, d.error || '电脑硬盘空间不够了'); return; }
+      if (x.status >= 400 && x.status < 500 && x.status !== 408) { failUpload(u, d.error || '电脑拒绝了（' + x.status + '）'); return; }
       retry(u);
     };
-    x.onerror = function () { if (u.xhr === x) { u.xhr = null; retry(u); } };
-    x.onabort = function () { if (u.xhr === x) { u.xhr = null; if (u.state === 'sending') retry(u); } };
+    x.onerror = x.onabort = function () {
+      if (my !== u.attempt) return;
+      u.xhr = null;
+      retry(u);
+    };
     x.send(u.size ? slice(u.file, start, end) : null);
   }
 
@@ -687,22 +708,42 @@
     u.sent = u.cur = n;
   }
 
+  // 连接断了：等一会儿（越试等得越久，最多 5 秒），然后先问进度再接着发
   function retry(u) {
-    if (u.state === 'canceled' || u.state === 'done') return;
+    if (u.state !== 'sending' && u.state !== 'retry') return;
     u.tries++;
-    if (u.tries > MAX_TRIES) { failUpload(u, '网络断开了'); return; }
-    u.state = 'retry';
-    rerender(u.id);
-    u.retryTimer = setTimeout(function () { if (u.state === 'retry') sendChunk(u); }, Math.min(700 * u.tries, 5000));
+    if (u.tries > MAX_TRIES) { failUpload(u, '连不上电脑了：手机还连着同一个 Wi-Fi 吗？电脑上的程序还开着吗？'); return; }
+    restart(u, Math.min(600 * u.tries, 5000));
   }
 
-  // 页面回到前台时，不等定时器，马上重试
-  function kick(u) {
+  // 作废正在进行的请求，delay 毫秒后问进度、接着传
+  function restart(u, delay) {
+    u.attempt++;
+    if (u.xhr) { var x = u.xhr; u.xhr = null; try { x.abort(); } catch (e) {} }
     clearTimeout(u.retryTimer);
-    if (u.state === 'retry') sendChunk(u);
+    u.state = 'retry';
+    rerender(u.id);
+    u.retryTimer = setTimeout(function () { probe(u); }, delay);
+  }
+
+  function probe(u) {
+    if (u.state !== 'retry') return;
+    var my = ++u.attempt;
+    api('GET', '/api/upload?id=' + u.id, null, function (st, d) {
+      if (my !== u.attempt || u.state !== 'retry') return;
+      if (st === 200 && d.done && d.item) { finishUpload(u, d.item); return; }
+      if (st === 200 && typeof d.received === 'number') {
+        setSent(u, Math.min(d.received, u.size));
+        sendChunk(u);
+        return;
+      }
+      if (st === 401) { failUpload(u, '需要重新输入访问码'); return; }
+      retry(u);
+    });
   }
 
   function failUpload(u, msg) {
+    u.attempt++;
     u.state = 'error';
     u.err = msg;
     release(u);
@@ -711,6 +752,8 @@
   }
 
   function finishUpload(u, item) {
+    u.attempt++;
+    clearTimeout(u.retryTimer);
     u.state = 'done';
     release(u);
     u.cur = u.size;
@@ -727,6 +770,7 @@
     var u = uploads[id];
     if (!u) return;
     u.state = 'canceled';
+    u.attempt++;
     clearTimeout(u.retryTimer);
     if (u.xhr) { var x = u.xhr; u.xhr = null; try { x.abort(); } catch (e) {} }
     release(u);
@@ -743,6 +787,7 @@
     u.state = 'queued';
     u.tries = 0;
     u.c409 = 0;
+    u.needProbe = true;
     queue.unshift(u);
     rerender(id);
     pump();
@@ -761,10 +806,12 @@
     var small = !!el.querySelector('.ov'), s = '';
     if (u.state === 'queued') s = '等待发送 · ' + fmtSize(u.size);
     else if (u.state === 'sending') {
+      var stuck = Date.now() - u.lastTick > 3000, fast = !stuck && u.speed >= 1024;
       s = Math.floor(pct) + '%';
-      if (u.speed > 0) s += ' · ' + fmtSize(u.speed) + '/s';
-      if (!small) s += ' · ' + fmtSize(u.cur) + ' / ' + fmtSize(u.size) + (u.speed > 0 ? ' · ' + fmtEta((u.size - u.cur) / u.speed) : '');
-    } else if (u.state === 'retry') s = '网络不稳，正在重连…';
+      if (stuck) s += ' · 等待网络…';
+      else if (fast) s += ' · ' + fmtSize(u.speed) + '/s';
+      if (!small) s += ' · ' + fmtSize(u.cur) + ' / ' + fmtSize(u.size) + (fast ? ' · ' + fmtEta((u.size - u.cur) / u.speed) : '');
+    } else if (u.state === 'retry') s = Math.floor(pct) + '% · 连接断了一下，正在接着传…';
     else if (u.state === 'error') s = '没发出去：' + (u.err || '网络断开了');
     else if (u.state === 'done') s = '已发送';
     setText(st, s);
@@ -787,37 +834,40 @@
     }
     var pct = total ? (done / total) * 100 : 0;
     el.innerHTML = '正在发送 ' + n + ' 个文件 · ' + fmtSize(done) + ' / ' + fmtSize(total) +
-      (speed > 0 ? ' · ' + fmtSize(speed) + '/s' : '') + (failed ? ' · ' + failed + ' 个失败' : '') +
-      '<div class="progress"><i style="width:' + pct.toFixed(1) + '%"></i></div>';
+      (speed >= 1024 ? ' · ' + fmtSize(speed) + '/s' : '') + (failed ? ' · ' + failed + ' 个失败' : '') +
+      '<div class="progress"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+      (isTouch() ? '<div class="tot-hint">传完之前别锁屏、别切到别的 App，不然浏览器会暂停传输（回来后会自动接着传）</div>' : '');
     el.hidden = false;
   }
 
   function startTicker() {
-    if (!ticker) { lastT = 0; ticker = setInterval(tick, 500); }
+    if (!ticker) ticker = setInterval(tick, 500);
+  }
+
+  // 速度按最近 3 秒实际传了多少来算：停住了就是 0，
+  // 不会像指数平均那样慢慢衰减成「0.0002 B/s」这种数
+  function rate(samples, now, value) {
+    samples.push([now, value]);
+    while (samples.length > 2 && now - samples[0][0] > 3000) samples.shift();
+    var dt = (now - samples[0][0]) / 1000;
+    return dt >= 0.9 ? Math.max(0, (value - samples[0][1]) / dt) : 0;
   }
 
   function tick() {
     var now = Date.now(), busy = false, id, u;
-    if (lastT) {
-      var dt = (now - lastT) / 1000, inst = (sentTotal - lastBytes) / dt;
-      speed = speed ? speed * 0.7 + inst * 0.3 : inst;
-    }
-    lastT = now;
-    lastBytes = sentTotal;
+    speed = rate(speedSamples, now, sentTotal);
     for (id in uploads) {
       u = uploads[id];
       if (u.state === 'sending') {
         busy = true;
-        var us = (u.cur - u.lastCur) / 0.5;
-        u.speed = u.speed ? u.speed * 0.7 + us * 0.3 : us;
-        u.lastCur = u.cur;
-        if (now - u.lastTick > STALL_MS && u.xhr) {
-          var x = u.xhr;
-          u.xhr = null;
-          try { x.abort(); } catch (e) {}
-          retry(u);
-        }
-      } else if (u.state === 'queued' || u.state === 'retry') busy = true;
+        u.speed = rate(u.samples, now, u.cur);
+        // 这么久一点进展都没有：当这个连接死了，问清楚进度重来
+        if (now - u.lastTick > STALL_MS) retry(u);
+      } else {
+        u.samples = [];
+        u.speed = 0;
+        if (u.state === 'queued' || u.state === 'retry') busy = true;
+      }
       paintUpload(u);
     }
     paintTotals();
@@ -825,6 +875,7 @@
       clearInterval(ticker);
       ticker = null;
       speed = 0;
+      speedSamples = [];
     }
   }
 
@@ -887,11 +938,13 @@
     var URL_ = window.URL || window.webkitURL;
     var canvas = document.createElement('canvas');
     if (!URL_ || !URL_.createObjectURL || !canvas.getContext) { cb(null); return; }
-    var src = URL_.createObjectURL(file), done = false, meta = {}, timer;
+    var src = URL_.createObjectURL(file), done = false, meta = {}, timer, v = null;
     function finish(ok) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      // 马上放掉视频解码器，别让它在手机上跟上传抢读文件
+      if (v) { try { v.removeAttribute('src'); v.load(); } catch (e) {} }
       try { URL_.revokeObjectURL(src); } catch (e) {}
       cb(ok && meta.w ? meta : null);
     }
@@ -915,12 +968,13 @@
       img.src = src;
       return;
     }
-    var v = document.createElement('video'), drawn = false;
+    var drawn = false;
+    v = document.createElement('video');
     v.muted = true;
     v.setAttribute('muted', '');
     v.setAttribute('playsinline', '');
     v.setAttribute('webkit-playsinline', '');
-    v.preload = 'auto';
+    v.preload = 'metadata';
     function grab() {
       if (drawn || done) return;
       if (v.videoWidth) { drawn = true; draw(v, v.videoWidth, v.videoHeight); }
@@ -1256,7 +1310,7 @@
     var h = '<h3>设置</h3>';
     h += '<div class="field"><label for="s-name">这台设备的名字</label><div class="row"><input class="inp" id="s-name" maxlength="24" value="' + esc(me.name) + '"><button class="btn" type="button" data-sa="save-name">保存</button></div><div class="hint">显示在你发出的消息旁边，方便分清是哪台设备发的。</div></div>';
     if (isHost && host) {
-      h += '<div class="field"><span class="lbl">收到的文件保存在</span><div class="path">' + esc(host.dir) + '</div>';
+      h += '<div class="field"><span class="lbl">收到的文件保存在' + (host.free ? '（这个盘还剩 ' + fmtSize(host.free) + '）' : '') + '</span><div class="path">' + esc(host.dir) + '</div>';
       h += '<div class="row" style="margin-top:8px"><button class="btn" type="button" data-sa="open-dir">打开文件夹</button></div></div>';
       h += '<div class="field"><label for="s-dir">换一个文件夹</label><div class="row"><input class="inp" id="s-dir" placeholder="粘贴完整路径，比如 D:\\收到的文件"><button class="btn" type="button" data-sa="save-dir">更改</button></div></div>';
       h += '<div class="field"><span class="lbl">访问码</span><div class="row"><div class="path" style="flex:1">' + (host.noAuth ? '已关闭' : esc(host.code)) + '</div><button class="btn" type="button" data-sa="reset-code">换一个</button></div>';
@@ -1282,6 +1336,7 @@
     switch (name) {
       case 'close': closeSheet(); break;
       case 'show-qr': showQR(); break;
+      case 'settings': showSettings(); break;
       case 'qr-all':
         qrAll = true;
         $('empty')._html = '';

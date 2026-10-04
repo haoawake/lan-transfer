@@ -44,6 +44,8 @@ type Server struct {
 	limiter *limiter
 	uploads keyedMutex
 	finalMu sync.Mutex
+	claimMu sync.Mutex
+	claims  map[string]*uploadClaim // 每个上传当前由哪个请求在处理
 	local   localIPs
 
 	// noHostTrust 让本机也当成普通设备，只在测试里用
@@ -67,6 +69,7 @@ func newServer(cfg *Config, dataDir string, port int) (*Server, error) {
 		assets:  loadAssets(),
 		limiter: newLimiter(),
 		uploads: keyedMutex{m: map[string]*kmEntry{}},
+		claims:  map[string]*uploadClaim{},
 	}
 	s.noHostTrust = os.Getenv("LT_DEV_GUEST") == "1"
 	go cleanIncoming(cfg.Dir)
@@ -93,6 +96,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /api/items", s.auth(s.handleItems))
 	mux.HandleFunc("POST /api/text", s.auth(s.handleText))
 	mux.HandleFunc("POST /api/upload", s.auth(s.handleUpload))
+	mux.HandleFunc("GET /api/upload", s.auth(s.handleUploadStatus))
 	mux.HandleFunc("POST /api/upload/cancel", s.auth(s.handleUploadCancel))
 	mux.HandleFunc("POST /api/thumb", s.auth(s.handleThumb))
 	mux.HandleFunc("POST /api/delete", s.auth(s.handleDelete))
@@ -398,7 +402,12 @@ func (s *Server) hostInfo() map[string]any {
 			Virtual: a.score < 0,
 		})
 	}
+	var free uint64
+	if f, err := diskFree(cfg.Dir); err == nil {
+		free = f
+	}
 	return map[string]any{
+		"free":      free, // 接收文件夹所在磁盘的剩余空间（字节），0 表示不知道
 		"urls":      urls,
 		"code":      cfg.Code,
 		"dir":       cfg.Dir,
